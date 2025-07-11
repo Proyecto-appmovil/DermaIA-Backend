@@ -1,0 +1,5 @@
+.env
+*.env
+credentials.json
+config.json
+node_modules/
