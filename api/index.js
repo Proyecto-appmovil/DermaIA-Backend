@@ -24,7 +24,7 @@ const port = 3000;
 
 // Habilitar CORS
 app.use(cors({
-  origin: ['https://derma-ia-front.vercel.app', 'http://localhost:8100'],
+  origin: ['https://derma-ia-front.vercel.app', 'http://localhost:4200'],
   methods: ['GET', 'POST'],
   credentials: true
 }));
