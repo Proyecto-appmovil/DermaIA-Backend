@@ -1,26 +1,17 @@
 {
   "name": "dermaia-backend",
-  "version": "1.0.0",
-  "description": "Backend API para DermaIA - Servicio de upload a AWS S3",
+  "version": "2.0.0",
+  "description": "Backend API para DermaIA - Servicio de upload a AWS S3 con Pre-signed URLs",
   "main": "api/index.js",
   "scripts": {
-    "start": "NODE_ENV=production node api/index.js",
+    "start": "node api/index.js",
     "dev": "NODE_ENV=development nodemon api/index.js",
-    "prod": "NODE_ENV=production node api/index.js",
     "dev:watch": "nodemon --watch api --watch .env api/index.js",
-    "setup": "mkdir -p logs && echo 'Setup completado'",
-    "setup:prod": "mkdir -p logs && npm ci --only=production",
     "test": "NODE_ENV=test jest",
     "test:watch": "NODE_ENV=test jest --watch",
     "lint": "eslint api/ --ext .js",
     "lint:fix": "eslint api/ --ext .js --fix",
-    "logs": "tail -f logs/combined.log",
-    "logs:error": "tail -f logs/error.log",
-    "health": "curl http://localhost:3000/health",
-    "pm2:start": "pm2 start ecosystem.config.js",
-    "pm2:stop": "pm2 stop dermaia-backend",
-    "pm2:restart": "pm2 restart dermaia-backend",
-    "pm2:logs": "pm2 logs dermaia-backend"
+    "health": "curl https://tu-app.vercel.app/health"
   },
   "keywords": [
     "dermaia",
@@ -29,6 +20,8 @@
     "aws",
     "s3",
     "upload",
+    "presigned-urls",
+    "serverless",
     "medical",
     "healthcare"
   ],
@@ -40,6 +33,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.450.0",
+    "@aws-sdk/s3-request-presigner": "^3.450.0",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -47,9 +41,7 @@
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
     "joi": "^17.11.0",
-    "multer": "^1.4.5-lts.1",
-    "uuid": "^9.0.1",
-    "winston": "^3.11.0"
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2",
