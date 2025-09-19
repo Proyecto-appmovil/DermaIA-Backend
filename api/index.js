@@ -6,26 +6,27 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
-const joi = require('joi');
 
-const envSchema = joi.object({
-  NODE_ENV: joi.string().valid('development', 'production', 'test').default('production'),
-  AWS_REGION: joi.string().required(),
-  S3_BUCKET_NAME: joi.string().required(),
-  AWS_ACCESS_KEY_ID: joi.string().required(),
-  AWS_SECRET_ACCESS_KEY: joi.string().required(),
-  ALLOWED_ORIGINS: joi.string().default('*'),
-  MAX_FILE_SIZE_MB: joi.number().min(1).max(4).default(4), // Máximo 4MB para Vercel
-  UPLOAD_RATE_LIMIT_WINDOW_MS: joi.number().default(15 * 60 * 1000),
-  UPLOAD_RATE_LIMIT_MAX: joi.number().default(10)
-}).unknown();
+require('dotenv').config();
 
-const { error, value: envVars } = envSchema.validate(process.env);
+const requiredEnvVars = ['AWS_REGION', 'S3_BUCKET_NAME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'];
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
-if (error) {
-  console.error(`❌ Error crítico en configuración: ${error.message}`);
-  throw new Error(`Configuration error: ${error.message}`);
+if (missingVars.length > 0) {
+  console.error(`❌ Variables de entorno faltantes: ${missingVars.join(', ')}`);
 }
+
+const envVars = {
+  NODE_ENV: process.env.NODE_ENV || 'production',
+  AWS_REGION: process.env.AWS_REGION || 'us-east-1',
+  S3_BUCKET_NAME: process.env.S3_BUCKET_NAME || '',
+  AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID || '',
+  AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY || '',
+  ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || '*',
+  MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB) || 4,
+  UPLOAD_RATE_LIMIT_WINDOW_MS: parseInt(process.env.UPLOAD_RATE_LIMIT_WINDOW_MS) || 900000,
+  UPLOAD_RATE_LIMIT_MAX: parseInt(process.env.UPLOAD_RATE_LIMIT_MAX) || 10
+};
 
 const logger = {
   info: (message, meta = {}) => console.log(JSON.stringify({ level: 'info', message, ...meta, timestamp: new Date().toISOString() })),
@@ -35,7 +36,6 @@ const logger = {
 
 const app = express();
 
-// Configuración básica
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
@@ -61,15 +61,22 @@ app.use(cors({
   credentials: true
 }));
 
-const s3Client = new S3Client({
-  region: envVars.AWS_REGION,
-  credentials: {
-    accessKeyId: envVars.AWS_ACCESS_KEY_ID,
-    secretAccessKey: envVars.AWS_SECRET_ACCESS_KEY
-  },
-  maxAttempts: 3,
-  retryMode: 'adaptive'
-});
+let s3Client = null;
+if (envVars.AWS_ACCESS_KEY_ID && envVars.AWS_SECRET_ACCESS_KEY) {
+  try {
+    s3Client = new S3Client({
+      region: envVars.AWS_REGION,
+      credentials: {
+        accessKeyId: envVars.AWS_ACCESS_KEY_ID,
+        secretAccessKey: envVars.AWS_SECRET_ACCESS_KEY
+      },
+      maxAttempts: 3,
+      retryMode: 'adaptive'
+    });
+  } catch (error) {
+    logger.error('Error creando cliente S3', { error: error.message });
+  }
+}
 
 const ALLOWED_MIME_TYPES = {
   'image/jpeg': '.jpg',
@@ -81,7 +88,7 @@ const ALLOWED_MIME_TYPES = {
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: envVars.MAX_FILE_SIZE_MB * 1024 * 1024, 
+    fileSize: envVars.MAX_FILE_SIZE_MB * 1024 * 1024,
     files: 1
   },
   fileFilter: (req, file, cb) => {
@@ -118,6 +125,10 @@ const generateSafeFileName = (originalName, mimetype) => {
 };
 
 const uploadToS3 = async (buffer, key, contentType, originalName) => {
+  if (!s3Client) {
+    throw new Error('Cliente S3 no disponible - verificar configuración de AWS');
+  }
+
   const command = new PutObjectCommand({
     Bucket: envVars.S3_BUCKET_NAME,
     Key: key,
@@ -143,10 +154,17 @@ app.get('/health', async (req, res) => {
     version: '1.0.0',
     environment: envVars.NODE_ENV,
     maxFileSize: `${envVars.MAX_FILE_SIZE_MB}MB`,
-    allowedTypes: Object.keys(ALLOWED_MIME_TYPES)
+    allowedTypes: Object.keys(ALLOWED_MIME_TYPES),
+    s3Client: s3Client ? 'configured' : 'not_configured',
+    bucket: envVars.S3_BUCKET_NAME ? 'configured' : 'not_configured'
   };
 
-  res.status(200).json(healthCheck);
+  if (!s3Client || !envVars.S3_BUCKET_NAME) {
+    healthCheck.status = 'degraded';
+  }
+
+  const statusCode = healthCheck.status === 'healthy' ? 200 : 503;
+  res.status(statusCode).json(healthCheck);
 });
 
 app.post('/api/v1/upload', 
@@ -161,6 +179,16 @@ app.post('/api/v1/upload',
         success: false,
         error: 'MISSING_FILE',
         message: 'No se ha proporcionado ningún archivo',
+        requestId
+      });
+    }
+
+    if (!s3Client || !envVars.S3_BUCKET_NAME) {
+      logger.error('Configuración S3 incompleta', { requestId });
+      return res.status(500).json({
+        success: false,
+        error: 'S3_CONFIGURATION_ERROR',
+        message: 'Configuración de almacenamiento no disponible',
         requestId
       });
     }
@@ -217,6 +245,9 @@ app.post('/api/v1/upload',
       } else if (error.code === 'AccessDenied') {
         errorCode = 'S3_PERMISSIONS_ERROR';
         message = 'Error de permisos del servicio de almacenamiento';
+      } else if (error.message.includes('Cliente S3 no disponible')) {
+        errorCode = 'S3_CLIENT_ERROR';
+        message = 'Servicio de almacenamiento no disponible';
       }
 
       res.status(statusCode).json({
@@ -277,7 +308,7 @@ app.use((err, req, res, next) => {
     });
   }
 
-  if (err.message.includes('CORS')) {
+  if (err.message && err.message.includes('CORS')) {
     return res.status(403).json({
       success: false,
       error: 'CORS_ERROR',
