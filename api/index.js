@@ -231,7 +231,13 @@ app.post('/api/v1/upload',
       logger.error('Error en upload', {
         requestId,
         error: error.message,
+        errorCode: error.code,
+        errorName: error.name,
+        stack: error.stack,
         fileName: req.file?.originalname,
+        fileSize: req.file?.size,
+        bucket: envVars.S3_BUCKET_NAME,
+        region: envVars.AWS_REGION,
         ip: req.ip
       });
 
@@ -241,20 +247,36 @@ app.post('/api/v1/upload',
       
       if (error.code === 'NoSuchBucket') {
         errorCode = 'S3_CONFIGURATION_ERROR';
-        message = 'Error de configuración del servicio de almacenamiento';
-      } else if (error.code === 'AccessDenied') {
+        message = `Bucket '${envVars.S3_BUCKET_NAME}' no encontrado`;
+      } else if (error.code === 'AccessDenied' || error.name === 'AccessDenied') {
         errorCode = 'S3_PERMISSIONS_ERROR';
         message = 'Error de permisos del servicio de almacenamiento';
+      } else if (error.code === 'InvalidAccessKeyId') {
+        errorCode = 'S3_CREDENTIALS_ERROR';
+        message = 'Credenciales de AWS inválidas';
+      } else if (error.code === 'SignatureDoesNotMatch') {
+        errorCode = 'S3_SIGNATURE_ERROR';
+        message = 'Error de autenticación con AWS';
       } else if (error.message.includes('Cliente S3 no disponible')) {
         errorCode = 'S3_CLIENT_ERROR';
         message = 'Servicio de almacenamiento no disponible';
+      } else if (error.name === 'NetworkingError' || error.code === 'ENOTFOUND') {
+        errorCode = 'NETWORK_ERROR';
+        message = 'Error de conectividad de red';
       }
 
       res.status(statusCode).json({
         success: false,
         error: errorCode,
         message,
-        requestId
+        requestId,
+        ...(envVars.NODE_ENV !== 'production' && {
+          debug: {
+            originalError: error.message,
+            errorCode: error.code,
+            errorName: error.name
+          }
+        })
       });
     }
   }
