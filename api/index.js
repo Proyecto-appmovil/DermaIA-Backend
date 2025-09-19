@@ -6,101 +6,35 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
-const winston = require('winston');
 const cors = require('cors');
 const joi = require('joi');
-const fs = require('fs');
-require('dotenv').config();
-
-const logsDir = 'logs';
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir);
-}
-
-const logFormat = winston.format.combine(
-  winston.format.timestamp(),
-  winston.format.errors({ stack: true }),
-  winston.format.json()
-);
-
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: logFormat,
-  defaultMeta: { 
-    service: 'dermaia-upload-service',
-    version: '1.0.0',
-    environment: process.env.NODE_ENV 
-  },
-  transports: [
-    new winston.transports.File({ 
-      filename: 'logs/error.log', 
-      level: 'error',
-      maxsize: 5242880, 
-      maxFiles: 5,
-      tailable: true
-    }),
-    new winston.transports.File({ 
-      filename: 'logs/combined.log',
-      maxsize: 5242880,
-      maxFiles: 10,
-      tailable: true
-    }),
-    new winston.transports.File({ 
-      filename: 'logs/access.log',
-      level: 'info',
-      maxsize: 5242880, 
-      maxFiles: 5,
-      tailable: true
-    })
-  ]
-});
-
-if (process.env.NODE_ENV !== 'production' || process.env.LOG_TO_CONSOLE === 'true') {
-  logger.add(new winston.transports.Console({
-    format: winston.format.combine(
-      winston.format.colorize(),
-      winston.format.simple()
-    )
-  }));
-}
 
 const envSchema = joi.object({
-  NODE_ENV: joi.string().valid('development', 'production', 'test').default('development'),
-  PORT: joi.number().default(3000),
+  NODE_ENV: joi.string().valid('development', 'production', 'test').default('production'),
   AWS_REGION: joi.string().required(),
   S3_BUCKET_NAME: joi.string().required(),
   AWS_ACCESS_KEY_ID: joi.string().required(),
   AWS_SECRET_ACCESS_KEY: joi.string().required(),
-  ALLOWED_ORIGINS: joi.string().required(),
+  ALLOWED_ORIGINS: joi.string().default('*'),
   MAX_FILE_SIZE_MB: joi.number().min(1).max(50).default(10),
-  UPLOAD_RATE_LIMIT_WINDOW_MS: joi.number().default(15 * 60 * 1000), // 15 minutos
-  UPLOAD_RATE_LIMIT_MAX: joi.number().default(10),
-  LOG_LEVEL: joi.string().valid('error', 'warn', 'info', 'debug').default('info'),
-  LOG_TO_CONSOLE: joi.boolean().default(false)
+  UPLOAD_RATE_LIMIT_WINDOW_MS: joi.number().default(15 * 60 * 1000),
+  UPLOAD_RATE_LIMIT_MAX: joi.number().default(10)
 }).unknown();
 
 const { error, value: envVars } = envSchema.validate(process.env);
 
 if (error) {
   console.error(`❌ Error crítico en configuración: ${error.message}`);
-  process.exit(1);
+  throw new Error(`Configuration error: ${error.message}`);
 }
 
-logger.info('Iniciando servidor DermaIA', {
-  environment: envVars.NODE_ENV,
-  port: envVars.PORT,
-  bucket: envVars.S3_BUCKET_NAME,
-  region: envVars.AWS_REGION,
-  maxFileSize: `${envVars.MAX_FILE_SIZE_MB}MB`,
-  allowedOrigins: envVars.ALLOWED_ORIGINS
-});
+const logger = {
+  info: (message, meta = {}) => console.log(JSON.stringify({ level: 'info', message, ...meta, timestamp: new Date().toISOString() })),
+  error: (message, meta = {}) => console.error(JSON.stringify({ level: 'error', message, ...meta, timestamp: new Date().toISOString() })),
+  warn: (message, meta = {}) => console.warn(JSON.stringify({ level: 'warn', message, ...meta, timestamp: new Date().toISOString() }))
+};
 
 const app = express();
-const port = envVars.PORT;
-
-if (envVars.NODE_ENV === 'production') {
-  app.set('trust proxy', 1);
-}
 
 app.use(helmet({
   contentSecurityPolicy: {
@@ -112,12 +46,7 @@ app.use(helmet({
       connectSrc: ["'self'"]
     }
   },
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-  hsts: {
-    maxAge: 31536000,
-    includeSubDomains: true,
-    preload: true
-  }
+  crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
 app.use(compression({
@@ -152,18 +81,18 @@ const uploadLimiter = rateLimit({
 });
 
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, 
-  max: 100, 
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false
 });
 
 app.use(generalLimiter);
 
-const allowedOrigins = envVars.ALLOWED_ORIGINS.split(',').map(origin => origin.trim());
+const allowedOrigins = envVars.ALLOWED_ORIGINS === '*' ? '*' : envVars.ALLOWED_ORIGINS.split(',').map(origin => origin.trim());
 
 app.use(cors({
-  origin: (origin, callback) => {
+  origin: allowedOrigins === '*' ? true : (origin, callback) => {
     if (!origin && envVars.NODE_ENV !== 'production') {
       return callback(null, true);
     }
@@ -172,10 +101,7 @@ app.use(cors({
       return callback(null, true);
     }
     
-    logger.warn('Origen CORS rechazado', {
-      origin,
-      allowedOrigins
-    });
+    logger.warn('Origen CORS rechazado', { origin, allowedOrigins });
     return callback(new Error('No permitido por política CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -207,7 +133,7 @@ const upload = multer({
   limits: {
     fileSize: envVars.MAX_FILE_SIZE_MB * 1024 * 1024,
     files: 1,
-    fieldSize: 1024 * 1024 
+    fieldSize: 1024 * 1024
   },
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_MIME_TYPES[file.mimetype]) {
@@ -255,7 +181,7 @@ const generateSafeFileName = (originalName, mimetype) => {
   const extension = ALLOWED_MIME_TYPES[mimetype];
   const timestamp = Date.now();
   const uuid = uuidv4();
-  const datePath = new Date().toISOString().slice(0, 10); 
+  const datePath = new Date().toISOString().slice(0, 10);
   
   return `uploads/${datePath}/${timestamp}-${uuid}${extension}`;
 };
@@ -267,7 +193,7 @@ const uploadToS3 = async (buffer, key, contentType, originalName) => {
     Body: buffer,
     ContentType: contentType,
     ServerSideEncryption: 'AES256',
-    CacheControl: 'max-age=31536000', 
+    CacheControl: 'max-age=31536000',
     Metadata: {
       'uploaded-at': new Date().toISOString(),
       'service': 'dermaia-api',
@@ -285,18 +211,13 @@ app.get('/health', async (req, res) => {
     timestamp: new Date().toISOString(),
     version: '1.0.0',
     environment: envVars.NODE_ENV,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
     services: {
-      s3: 'unknown'
+      s3: 'checking'
     }
   };
 
   try {
-    await s3Client.send({
-      input: {},
-      name: 'ListBucketsCommand'
-    });
+    await s3Client.config.credentials();
     healthCheck.services.s3 = 'healthy';
   } catch (error) {
     healthCheck.services.s3 = 'error';
@@ -305,18 +226,6 @@ app.get('/health', async (req, res) => {
 
   const statusCode = healthCheck.status === 'healthy' ? 200 : 503;
   res.status(statusCode).json(healthCheck);
-});
-
-app.get('/metrics', (req, res) => {
-  if (envVars.NODE_ENV === 'production') {
-    return res.status(404).json({ error: 'Not found' });
-  }
-  
-  res.json({
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    timestamp: new Date().toISOString()
-  });
 });
 
 app.post('/api/v1/upload', 
@@ -484,47 +393,5 @@ app.use((req, res) => {
     message: 'Endpoint no encontrado'
   });
 });
-
-const gracefulShutdown = (signal) => {
-  logger.info(`Señal ${signal} recibida, cerrando servidor...`);
-  
-  server.close(() => {
-    logger.info('Servidor cerrado correctamente');
-    process.exit(0);
-  });
-  
-  setTimeout(() => {
-    logger.error('Forzando cierre del servidor');
-    process.exit(1);
-  }, 30000);
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-process.on('uncaughtException', (error) => {
-  logger.error('Excepción no capturada', { error: error.message, stack: error.stack });
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Promise rechazada no manejada', { reason, promise });
-  process.exit(1);
-});
-
-const server = app.listen(port, '0.0.0.0', () => {
-  logger.info(`🚀 Servidor DermaIA iniciado`, {
-    port,
-    environment: envVars.NODE_ENV,
-    maxFileSize: `${envVars.MAX_FILE_SIZE_MB}MB`,
-    bucket: envVars.S3_BUCKET_NAME,
-    region: envVars.AWS_REGION,
-    pid: process.pid
-  });
-});
-
-server.timeout = 60000;
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
 
 module.exports = app;
