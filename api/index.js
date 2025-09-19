@@ -7,15 +7,19 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 
+// Cargar variables de entorno
 require('dotenv').config();
 
+// Validación básica de variables de entorno (sin joi para evitar crashes)
 const requiredEnvVars = ['AWS_REGION', 'S3_BUCKET_NAME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'];
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
 if (missingVars.length > 0) {
   console.error(`❌ Variables de entorno faltantes: ${missingVars.join(', ')}`);
+  // En lugar de throw, continuamos con valores por defecto para que no crashee
 }
 
+// Configuración con valores por defecto
 const envVars = {
   NODE_ENV: process.env.NODE_ENV || 'production',
   AWS_REGION: process.env.AWS_REGION || 'us-east-1',
@@ -35,6 +39,8 @@ const logger = {
 };
 
 const app = express();
+
+app.set('trust proxy', 1);
 
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
@@ -165,6 +171,30 @@ app.get('/health', async (req, res) => {
 
   const statusCode = healthCheck.status === 'healthy' ? 200 : 503;
   res.status(statusCode).json(healthCheck);
+});
+
+app.get('/debug', async (req, res) => {
+  if (envVars.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
+  const debug = {
+    env: {
+      NODE_ENV: envVars.NODE_ENV,
+      AWS_REGION: envVars.AWS_REGION,
+      S3_BUCKET_NAME: envVars.S3_BUCKET_NAME,
+      AWS_ACCESS_KEY_ID: envVars.AWS_ACCESS_KEY_ID ? `${envVars.AWS_ACCESS_KEY_ID.substring(0, 8)}...` : 'not_set',
+      AWS_SECRET_ACCESS_KEY: envVars.AWS_SECRET_ACCESS_KEY ? 'set' : 'not_set',
+      ALLOWED_ORIGINS: envVars.ALLOWED_ORIGINS,
+      MAX_FILE_SIZE_MB: envVars.MAX_FILE_SIZE_MB
+    },
+    s3Client: {
+      configured: !!s3Client,
+      region: s3Client?.config?.region || 'not_set'
+    }
+  };
+
+  res.json(debug);
 });
 
 app.post('/api/v1/upload', 
