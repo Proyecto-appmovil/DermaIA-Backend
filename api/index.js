@@ -4,22 +4,17 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 
-// Cargar variables de entorno
 require('dotenv').config();
 
-// Validación básica de variables de entorno (sin joi para evitar crashes)
 const requiredEnvVars = ['AWS_REGION', 'S3_BUCKET_NAME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'];
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
 if (missingVars.length > 0) {
   console.error(`❌ Variables de entorno faltantes: ${missingVars.join(', ')}`);
-  // En lugar de throw, continuamos con valores por defecto para que no crashee
 }
 
-// Configuración con valores por defecto
 const envVars = {
   NODE_ENV: process.env.NODE_ENV || 'production',
   AWS_REGION: process.env.AWS_REGION || 'us-east-1',
@@ -27,9 +22,7 @@ const envVars = {
   AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID || '',
   AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY || '',
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || '*',
-  MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB) || 4,
-  UPLOAD_RATE_LIMIT_WINDOW_MS: parseInt(process.env.UPLOAD_RATE_LIMIT_WINDOW_MS) || 900000,
-  UPLOAD_RATE_LIMIT_MAX: parseInt(process.env.UPLOAD_RATE_LIMIT_MAX) || 10
+  MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB) || 4
 };
 
 const logger = {
@@ -45,18 +38,6 @@ app.set('trust proxy', 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
-
-const uploadLimiter = rateLimit({
-  windowMs: envVars.UPLOAD_RATE_LIMIT_WINDOW_MS,
-  max: envVars.UPLOAD_RATE_LIMIT_MAX,
-  message: {
-    success: false,
-    error: 'RATE_LIMIT_EXCEEDED',
-    message: `Demasiadas solicitudes. Máximo ${envVars.UPLOAD_RATE_LIMIT_MAX} uploads cada ${Math.floor(envVars.UPLOAD_RATE_LIMIT_WINDOW_MS / 1000 / 60)} minutos.`
-  },
-  standardHeaders: true,
-  legacyHeaders: false
-});
 
 const allowedOrigins = envVars.ALLOWED_ORIGINS === '*' ? '*' : envVars.ALLOWED_ORIGINS.split(',').map(origin => origin.trim());
 
@@ -198,7 +179,6 @@ app.get('/debug', async (req, res) => {
 });
 
 app.post('/api/v1/upload', 
-  uploadLimiter,
   upload.single('file'),
   async (req, res) => {
     const requestId = uuidv4();
