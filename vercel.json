@@ -4,12 +4,42 @@
     {
       "src": "api/index.js",
       "use": "@vercel/node@latest",
-      "config": { "maxLambdaSize": "50mb" }
+      "config": {
+        "maxLambdaSize": "10mb"
+      }
     }
   ],
   "routes": [
-    { "src": "/(.*)", "dest": "/api/index.js" }
+    {
+      "src": "/health",
+      "dest": "/api/index.js",
+      "methods": ["GET"]
+    },
+    {
+      "src": "/api/v1/upload/presigned",
+      "dest": "/api/index.js",
+      "methods": ["POST", "OPTIONS"]
+    },
+    {
+      "src": "/api/v1/upload/confirm",
+      "dest": "/api/index.js",
+      "methods": ["POST", "OPTIONS"]
+    },
+    {
+      "src": "/api/v1/upload/small",
+      "dest": "/api/index.js",
+      "methods": ["POST", "OPTIONS"]
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.js"
+    }
   ],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 15
+    }
+  },
   "env": {
     "NODE_ENV": "production"
   }

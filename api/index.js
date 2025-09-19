@@ -1,6 +1,6 @@
 const express = require('express');
-const multer = require('multer');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const helmet = require('helmet');
@@ -18,7 +18,8 @@ const envSchema = joi.object({
   ALLOWED_ORIGINS: joi.string().default('*'),
   MAX_FILE_SIZE_MB: joi.number().min(1).max(50).default(10),
   UPLOAD_RATE_LIMIT_WINDOW_MS: joi.number().default(15 * 60 * 1000),
-  UPLOAD_RATE_LIMIT_MAX: joi.number().default(10)
+  UPLOAD_RATE_LIMIT_MAX: joi.number().default(10),
+  PRESIGNED_URL_EXPIRY: joi.number().default(300) // 5 minutos
 }).unknown();
 
 const { error, value: envVars } = envSchema.validate(process.env);
@@ -36,6 +37,7 @@ const logger = {
 
 const app = express();
 
+app.use(express.json({ limit: '1mb' }));
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -64,20 +66,7 @@ const uploadLimiter = rateLimit({
     retryAfter: Math.floor(envVars.UPLOAD_RATE_LIMIT_WINDOW_MS / 1000)
   },
   standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    logger.warn('Rate limit excedido', {
-      ip: req.ip,
-      userAgent: req.get('User-Agent'),
-      url: req.originalUrl
-    });
-    res.status(429).json({
-      success: false,
-      error: 'RATE_LIMIT_EXCEEDED',
-      message: `Demasiadas solicitudes. Máximo ${envVars.UPLOAD_RATE_LIMIT_MAX} uploads cada ${Math.floor(envVars.UPLOAD_RATE_LIMIT_WINDOW_MS / 1000 / 60)} minutos.`,
-      retryAfter: Math.floor(envVars.UPLOAD_RATE_LIMIT_WINDOW_MS / 1000)
-    });
-  }
+  legacyHeaders: false
 });
 
 const generalLimiter = rateLimit({
@@ -104,7 +93,7 @@ app.use(cors({
     logger.warn('Origen CORS rechazado', { origin, allowedOrigins });
     return callback(new Error('No permitido por política CORS'));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
   maxAge: 86400
@@ -128,36 +117,40 @@ const ALLOWED_MIME_TYPES = {
   'application/pdf': '.pdf'
 };
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: envVars.MAX_FILE_SIZE_MB * 1024 * 1024,
-    files: 1,
-    fieldSize: 1024 * 1024
-  },
-  fileFilter: (req, file, cb) => {
-    if (!ALLOWED_MIME_TYPES[file.mimetype]) {
-      const error = new Error(`Tipo de archivo no permitido: ${file.mimetype}`);
-      error.code = 'INVALID_FILE_TYPE';
-      return cb(error);
-    }
-    
-    const fileExtension = path.extname(file.originalname).toLowerCase();
-    if (fileExtension !== ALLOWED_MIME_TYPES[file.mimetype]) {
-      const error = new Error('La extensión del archivo no coincide con su tipo');
-      error.code = 'EXTENSION_MISMATCH';
-      return cb(error);
-    }
-    
-    if (!/^[a-zA-Z0-9._-]+$/.test(file.originalname)) {
-      const error = new Error('Nombre de archivo inválido. Solo se permiten letras, números, puntos, guiones y guiones bajos.');
-      error.code = 'INVALID_FILENAME';
-      return cb(error);
-    }
-    
-    cb(null, true);
+const generateSafeFileName = (originalName, mimetype) => {
+  const extension = ALLOWED_MIME_TYPES[mimetype];
+  const timestamp = Date.now();
+  const uuid = uuidv4();
+  const datePath = new Date().toISOString().slice(0, 10);
+  
+  return `uploads/${datePath}/${timestamp}-${uuid}${extension}`;
+};
+
+const validateFileRequest = (fileName, fileSize, mimeType) => {
+  const errors = [];
+
+  if (!fileName || !/^[a-zA-Z0-9._-]+$/.test(fileName)) {
+    errors.push('Nombre de archivo inválido. Solo se permiten letras, números, puntos, guiones y guiones bajos.');
   }
-});
+
+  if (!ALLOWED_MIME_TYPES[mimeType]) {
+    errors.push(`Tipo de archivo no permitido: ${mimeType}`);
+  }
+
+  if (fileName && mimeType && ALLOWED_MIME_TYPES[mimeType]) {
+    const fileExtension = path.extname(fileName).toLowerCase();
+    if (fileExtension !== ALLOWED_MIME_TYPES[mimeType]) {
+      errors.push('La extensión del archivo no coincide con su tipo');
+    }
+  }
+
+  const maxSize = envVars.MAX_FILE_SIZE_MB * 1024 * 1024;
+  if (fileSize > maxSize) {
+    errors.push(`Archivo demasiado grande. Tamaño máximo: ${envVars.MAX_FILE_SIZE_MB}MB`);
+  }
+
+  return errors;
+};
 
 app.use((req, res, next) => {
   const startTime = Date.now();
@@ -177,40 +170,15 @@ app.use((req, res, next) => {
   next();
 });
 
-const generateSafeFileName = (originalName, mimetype) => {
-  const extension = ALLOWED_MIME_TYPES[mimetype];
-  const timestamp = Date.now();
-  const uuid = uuidv4();
-  const datePath = new Date().toISOString().slice(0, 10);
-  
-  return `uploads/${datePath}/${timestamp}-${uuid}${extension}`;
-};
-
-const uploadToS3 = async (buffer, key, contentType, originalName) => {
-  const command = new PutObjectCommand({
-    Bucket: envVars.S3_BUCKET_NAME,
-    Key: key,
-    Body: buffer,
-    ContentType: contentType,
-    ServerSideEncryption: 'AES256',
-    CacheControl: 'max-age=31536000',
-    Metadata: {
-      'uploaded-at': new Date().toISOString(),
-      'service': 'dermaia-api',
-      'original-name': originalName,
-      'file-size': buffer.length.toString()
-    }
-  });
-
-  return await s3Client.send(command);
-};
-
+// Health check endpoint
 app.get('/health', async (req, res) => {
   const healthCheck = {
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '1.0.0',
+    version: '2.0.0',
     environment: envVars.NODE_ENV,
+    uploadMethod: 'presigned-urls',
+    maxFileSize: `${envVars.MAX_FILE_SIZE_MB}MB`,
     services: {
       s3: 'checking'
     }
@@ -228,84 +196,270 @@ app.get('/health', async (req, res) => {
   res.status(statusCode).json(healthCheck);
 });
 
-app.post('/api/v1/upload', 
+app.post('/api/v1/upload/presigned', 
   uploadLimiter,
-  upload.single('file'),
   async (req, res) => {
     const requestId = uuidv4();
     
-    if (!req.file) {
-      logger.warn('Upload sin archivo', { requestId, ip: req.ip });
-      return res.status(400).json({
-        success: false,
-        error: 'MISSING_FILE',
-        message: 'No se ha proporcionado ningún archivo',
-        requestId
-      });
-    }
-    
     try {
-      logger.info('Iniciando upload', {
-        requestId,
-        fileName: req.file.originalname,
-        fileSize: req.file.size,
-        mimetype: req.file.mimetype,
-        ip: req.ip
+      const { fileName, fileSize, mimeType } = req.body;
+
+      // Validar parámetros requeridos
+      if (!fileName || !fileSize || !mimeType) {
+        return res.status(400).json({
+          success: false,
+          error: 'MISSING_PARAMETERS',
+          message: 'Se requieren fileName, fileSize y mimeType',
+          requestId
+        });
+      }
+
+      // Validar archivo
+      const validationErrors = validateFileRequest(fileName, fileSize, mimeType);
+      if (validationErrors.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'VALIDATION_ERROR',
+          message: 'Error de validación del archivo',
+          details: validationErrors,
+          allowedTypes: Object.keys(ALLOWED_MIME_TYPES),
+          requestId
+        });
+      }
+
+      const s3Key = generateSafeFileName(fileName, mimeType);
+      
+      // Crear comando para upload
+      const command = new PutObjectCommand({
+        Bucket: envVars.S3_BUCKET_NAME,
+        Key: s3Key,
+        ContentType: mimeType,
+        ContentLength: fileSize,
+        ServerSideEncryption: 'AES256',
+        CacheControl: 'max-age=31536000',
+        Metadata: {
+          'uploaded-at': new Date().toISOString(),
+          'service': 'dermaia-api',
+          'original-name': fileName,
+          'file-size': fileSize.toString(),
+          'request-id': requestId
+        }
       });
 
-      const s3Key = generateSafeFileName(req.file.originalname, req.file.mimetype);
-      
-      await uploadToS3(req.file.buffer, s3Key, req.file.mimetype, req.file.originalname);
+      // Generar URL firmada
+      const presignedUrl = await getSignedUrl(s3Client, command, {
+        expiresIn: envVars.PRESIGNED_URL_EXPIRY
+      });
 
       const fileUrl = `https://${envVars.S3_BUCKET_NAME}.s3.${envVars.AWS_REGION}.amazonaws.com/${s3Key}`;
 
-      logger.info('Upload exitoso', {
+      logger.info('URL firmada generada', {
+        requestId,
+        fileName,
+        fileSize,
+        mimeType,
+        s3Key,
+        ip: req.ip
+      });
+
+      res.status(200).json({
+        success: true,
+        data: {
+          uploadUrl: presignedUrl,
+          fileUrl,
+          s3Key,
+          expiresIn: envVars.PRESIGNED_URL_EXPIRY,
+          uploadMethod: 'PUT',
+          headers: {
+            'Content-Type': mimeType,
+            'Content-Length': fileSize
+          }
+        },
+        message: 'URL de upload generada correctamente',
+        requestId
+      });
+
+    } catch (error) {
+      logger.error('Error generando URL firmada', {
+        requestId,
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip
+      });
+
+      res.status(500).json({
+        success: false,
+        error: 'PRESIGNED_URL_ERROR',
+        message: 'Error interno al generar URL de upload',
+        requestId
+      });
+    }
+  }
+);
+
+app.post('/api/v1/upload/confirm',
+  async (req, res) => {
+    const requestId = uuidv4();
+    
+    try {
+      const { s3Key } = req.body;
+
+      if (!s3Key) {
+        return res.status(400).json({
+          success: false,
+          error: 'MISSING_S3_KEY',
+          message: 'Se requiere s3Key para confirmar el upload',
+          requestId
+        });
+      }
+
+      const command = new GetObjectCommand({
+        Bucket: envVars.S3_BUCKET_NAME,
+        Key: s3Key
+      });
+
+      const response = await s3Client.send(command);
+      
+      const fileUrl = `https://${envVars.S3_BUCKET_NAME}.s3.${envVars.AWS_REGION}.amazonaws.com/${s3Key}`;
+
+      logger.info('Upload confirmado', {
         requestId,
         s3Key,
-        fileUrl,
-        fileSize: req.file.size
+        fileSize: response.ContentLength,
+        ip: req.ip
+      });
+
+      res.status(200).json({
+        success: true,
+        data: {
+          fileUrl,
+          s3Key,
+          size: response.ContentLength,
+          type: response.ContentType,
+          uploadedAt: response.LastModified,
+          metadata: response.Metadata
+        },
+        message: 'Upload confirmado exitosamente',
+        requestId
+      });
+
+    } catch (error) {
+      logger.error('Error confirmando upload', {
+        requestId,
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip
+      });
+
+      if (error.name === 'NoSuchKey') {
+        return res.status(404).json({
+          success: false,
+          error: 'FILE_NOT_FOUND',
+          message: 'El archivo no fue encontrado en S3',
+          requestId
+        });
+      }
+
+      res.status(500).json({
+        success: false,
+        error: 'CONFIRMATION_ERROR',
+        message: 'Error interno al confirmar el upload',
+        requestId
+      });
+    }
+  }
+);
+
+app.post('/api/v1/upload/small',
+  uploadLimiter,
+  express.raw({ 
+    type: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+    limit: '4mb' 
+  }),
+  async (req, res) => {
+    const requestId = uuidv4();
+    
+    try {
+      if (!req.body || req.body.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'MISSING_FILE_DATA',
+          message: 'No se recibieron datos del archivo',
+          requestId
+        });
+      }
+
+      const contentType = req.get('content-type');
+      const fileName = req.get('x-file-name') || `file-${Date.now()}${ALLOWED_MIME_TYPES[contentType] || ''}`;
+      
+      if (!ALLOWED_MIME_TYPES[contentType]) {
+        return res.status(400).json({
+          success: false,
+          error: 'INVALID_CONTENT_TYPE',
+          message: `Tipo de contenido no permitido: ${contentType}`,
+          allowedTypes: Object.keys(ALLOWED_MIME_TYPES),
+          requestId
+        });
+      }
+
+      const s3Key = generateSafeFileName(fileName, contentType);
+      
+      const command = new PutObjectCommand({
+        Bucket: envVars.S3_BUCKET_NAME,
+        Key: s3Key,
+        Body: req.body,
+        ContentType: contentType,
+        ServerSideEncryption: 'AES256',
+        CacheControl: 'max-age=31536000',
+        Metadata: {
+          'uploaded-at': new Date().toISOString(),
+          'service': 'dermaia-api',
+          'original-name': fileName,
+          'file-size': req.body.length.toString(),
+          'upload-method': 'direct',
+          'request-id': requestId
+        }
+      });
+
+      await s3Client.send(command);
+      
+      const fileUrl = `https://${envVars.S3_BUCKET_NAME}.s3.${envVars.AWS_REGION}.amazonaws.com/${s3Key}`;
+
+      logger.info('Upload directo exitoso', {
+        requestId,
+        fileName,
+        fileSize: req.body.length,
+        contentType,
+        s3Key,
+        ip: req.ip
       });
 
       res.status(201).json({
         success: true,
         data: {
           fileUrl,
-          fileName: req.file.originalname,
-          size: req.file.size,
-          type: req.file.mimetype,
-          uploadedAt: new Date().toISOString()
+          fileName,
+          size: req.body.length,
+          type: contentType,
+          uploadedAt: new Date().toISOString(),
+          uploadMethod: 'direct'
         },
-        message: 'Archivo subido correctamente'
+        message: 'Archivo subido correctamente (método directo)',
+        requestId
       });
 
     } catch (error) {
-      logger.error('Error en upload', {
+      logger.error('Error en upload directo', {
         requestId,
         error: error.message,
         stack: error.stack,
-        fileName: req.file?.originalname,
         ip: req.ip
       });
 
-      let statusCode = 500;
-      let errorCode = 'UPLOAD_ERROR';
-      let message = 'Error interno al procesar el archivo';
-      
-      if (error.code === 'NoSuchBucket') {
-        errorCode = 'S3_CONFIGURATION_ERROR';
-        message = 'Error de configuración del servicio de almacenamiento';
-      } else if (error.code === 'AccessDenied') {
-        errorCode = 'S3_PERMISSIONS_ERROR';
-        message = 'Error de permisos del servicio de almacenamiento';
-      } else if (error.name === 'TimeoutError') {
-        errorCode = 'TIMEOUT_ERROR';
-        message = 'Tiempo de espera agotado. Intenta con un archivo más pequeño.';
-      }
-
-      res.status(statusCode).json({
+      res.status(500).json({
         success: false,
-        error: errorCode,
-        message,
+        error: 'DIRECT_UPLOAD_ERROR',
+        message: 'Error interno al procesar el archivo',
         requestId
       });
     }
@@ -324,39 +478,12 @@ app.use((err, req, res, next) => {
     ip: req.ip
   });
 
-  if (err instanceof multer.MulterError) {
-    let message = 'Error al procesar el archivo';
-    let errorCode = 'MULTER_ERROR';
-    
-    switch (err.code) {
-      case 'LIMIT_FILE_SIZE':
-        message = `Archivo demasiado grande. Tamaño máximo: ${envVars.MAX_FILE_SIZE_MB}MB`;
-        errorCode = 'FILE_TOO_LARGE';
-        break;
-      case 'LIMIT_FILE_COUNT':
-        message = 'Demasiados archivos';
-        errorCode = 'TOO_MANY_FILES';
-        break;
-      case 'LIMIT_UNEXPECTED_FILE':
-        message = 'Campo de archivo inesperado';
-        errorCode = 'UNEXPECTED_FILE';
-        break;
-    }
-    
-    return res.status(400).json({
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({
       success: false,
-      error: errorCode,
-      message,
-      requestId
-    });
-  }
-
-  if (err.code === 'INVALID_FILE_TYPE' || err.code === 'EXTENSION_MISMATCH' || err.code === 'INVALID_FILENAME') {
-    return res.status(400).json({
-      success: false,
-      error: err.code,
-      message: err.message,
-      allowedTypes: Object.keys(ALLOWED_MIME_TYPES),
+      error: 'PAYLOAD_TOO_LARGE',
+      message: 'El archivo es demasiado grande para upload directo. Usa el endpoint /api/v1/upload/presigned',
+      maxDirectSize: '4MB',
       requestId
     });
   }
@@ -381,16 +508,16 @@ app.use((err, req, res, next) => {
 });
 
 app.use((req, res) => {
-  logger.warn('Endpoint no encontrado', {
-    url: req.originalUrl,
-    method: req.method,
-    ip: req.ip
-  });
-  
   res.status(404).json({
     success: false,
     error: 'NOT_FOUND',
-    message: 'Endpoint no encontrado'
+    message: 'Endpoint no encontrado',
+    availableEndpoints: [
+      'GET /health',
+      'POST /api/v1/upload/presigned',
+      'POST /api/v1/upload/confirm',
+      'POST /api/v1/upload/small'
+    ]
   });
 });
 
