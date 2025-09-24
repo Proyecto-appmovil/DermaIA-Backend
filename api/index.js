@@ -8,6 +8,8 @@ const cors = require('cors');
 
 require('dotenv').config();
 
+
+
 const requiredEnvVars = ['AWS_REGION', 'S3_BUCKET_NAME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'];
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
@@ -66,7 +68,7 @@ if (envVars.AWS_ACCESS_KEY_ID && envVars.AWS_SECRET_ACCESS_KEY) {
 }
 
 const ALLOWED_MIME_TYPES = {
-  'image/jpeg': '.jpg',
+  'image/jpeg': ['.jpg', '.jpeg', '.jpe', '.jfif'],
   'image/png': '.png',
   'image/webp': '.webp',
   'application/pdf': '.pdf'
@@ -358,10 +360,9 @@ app.use((err, req, res, next) => {
 });
 
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'NOT_FOUND',
-    message: 'Endpoint no encontrado'
+  res.status(200).json({
+    success: true,
+    message: 'Trabajando sobre el puerto 3000. API de DermaIA funcionando correctamente.'
   });
 });
 

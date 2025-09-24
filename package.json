@@ -5,7 +5,7 @@
   "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js",
-    "dev": "NODE_ENV=development nodemon api/index.js"
+    "dev": "nodemon api/index.js"
   },
   "keywords": [
     "dermaia",
