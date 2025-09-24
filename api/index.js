@@ -87,9 +87,8 @@ const upload = multer({
       return cb(error);
     }
     
-    const fileExtension = path.extname(file.originalname).toLowerCase();
-    if (fileExtension !== ALLOWED_MIME_TYPES[file.mimetype]) {
-      const error = new Error('La extensión del archivo no coincide con su tipo');
+    if (!allowedExtensions.includes(fileExtension)) {
+      const error = new Error(`La extensión ${fileExtension} no es válida para ${file.mimetype}. Extensiones permitidas: ${allowedExtensions.join(', ')}`);
       error.code = 'EXTENSION_MISMATCH';
       return cb(error);
     }
