@@ -68,10 +68,10 @@ if (envVars.AWS_ACCESS_KEY_ID && envVars.AWS_SECRET_ACCESS_KEY) {
 }
 
 const ALLOWED_MIME_TYPES = {
-  'image/jpeg': ['.jpg', '.jpeg', '.jpe', '.jfif'],
-  'image/png': '.png',
-  'image/webp': '.webp',
-  'application/pdf': '.pdf'
+  'image/jpeg': ['.jpg', '.jpeg', '.jpe', '.jfif'],  // ← Múltiples extensiones
+  'image/png': ['.png'],
+  'image/webp': ['.webp'],
+  'application/pdf': ['.pdf']
 };
 
 const upload = multer({
